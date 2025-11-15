@@ -357,11 +357,20 @@ def main(args):
             }
             torch.save(checkpoint, output_dir / f"checkpoint_epoch_{epoch+1}.pth")
         
+        # Save last epoch checkpoint (always overwrite)
+        last_checkpoint = {
+            'model': model.state_dict(),
+            'epoch': epoch,
+            'best_iou': best_iou
+        }
+        torch.save(last_checkpoint, output_dir / f"last_epoch_{epoch+1}.pth")
+        
         # Save history
         with open(output_dir / "history.json", 'w') as f:
             json.dump(history, f, indent=2)
     
     print(f"\nTraining complete! Best IoU: {best_iou:.4f}")
+    print(f"Last epoch: {args.epochs}")
     print(f"Checkpoints saved to: {output_dir}")
 
 
