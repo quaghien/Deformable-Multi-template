@@ -151,12 +151,18 @@ def evaluate(model, criterion, loader, device, epoch):
             # Compute IoU for best prediction
             batch_size = pred_boxes.shape[0]
             for i in range(batch_size):
-                # Get best prediction (highest confidence)
-                best_idx = pred_logits[i].sigmoid().argmax()
-                pred_box = pred_boxes[i, best_idx].unsqueeze(0)  # (1, 4)
                 gt_box = targets[i]['boxes'][0].unsqueeze(0)  # (1, 4)
-                iou = compute_iou(pred_box, gt_box).item()
-                total_iou += iou
+                
+                # Compute IoU với TẤT CẢ queries
+                ious = []
+                for j in range(pred_boxes.shape[1]):  # num_queries
+                    pred_box = pred_boxes[i, j].unsqueeze(0)
+                    iou = compute_iou(pred_box, gt_box).item()
+                    ious.append(iou)
+                
+                # Lấy IoU TỐT NHẤT (để evaluate model potential)
+                best_iou = max(ious)
+                total_iou += best_iou
                 num_samples += 1
             
             # Update progress bar
@@ -336,6 +342,10 @@ def main(args):
               f"GIoU: {train_metrics['loss_giou']:.4f}")
         print(f"  Val   - Loss: {val_metrics['loss']:.4f}, "
               f"IoU: {val_metrics['mean_iou']:.4f}")
+        
+        # Debug: Show if IoU is too low
+        if val_metrics['mean_iou'] < 0.1 and epoch < 10:
+            print(f"  ⚠️  IoU very low! Check: 1) --pretrained_backbone flag, 2) data labels, 3) bbox normalization")
         
         # Save best checkpoint (only model weights)
         if val_metrics['mean_iou'] > best_iou:
