@@ -9,21 +9,23 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from model import build_model, build_criterion
 from utils import build_dataset, collate_fn
 
 
-def train_one_epoch(model, criterion, loader, optimizer, scheduler, device, epoch):
-    """Train for one epoch."""
+def train_one_epoch(model, criterion, loader, optimizer, scheduler, device, epoch, scaler=None):
+    """Train for one epoch with optional mixed precision."""
     model.train()
     total_loss = 0.0
     total_loss_ce = 0.0
     total_loss_bbox = 0.0
     total_loss_giou = 0.0
+    use_amp = scaler is not None
     
-    pbar = tqdm(loader, desc=f"Epoch {epoch+1} [Train]", ncols=120)
+    pbar = tqdm(loader, desc=f"Epoch {epoch+1} [Train]{'[FP16]' if use_amp else '[FP32]'}", ncols=120)
     for templates, searches, targets in pbar:
         templates = templates.to(device)
         searches = searches.to(device)
@@ -35,25 +37,44 @@ def train_one_epoch(model, criterion, loader, optimizer, scheduler, device, epoc
         
         optimizer.zero_grad()
         
-        # Forward pass
-        pred_logits, pred_boxes = model(templates, searches)
+        # Forward pass with optional autocast
+        if use_amp:
+            with autocast():
+                pred_logits, pred_boxes = model(templates, searches)
+                
+                # Prepare outputs dict
+                outputs = {
+                    'pred_logits': pred_logits,
+                    'pred_boxes': pred_boxes
+                }
+                
+                # Compute losses
+                losses = criterion(outputs, targets)
+                loss = sum(losses.values())
+        else:
+            pred_logits, pred_boxes = model(templates, searches)
+            
+            # Prepare outputs dict
+            outputs = {
+                'pred_logits': pred_logits,
+                'pred_boxes': pred_boxes
+            }
+            
+            # Compute losses
+            losses = criterion(outputs, targets)
+            loss = sum(losses.values())
         
-        # Prepare outputs dict
-        outputs = {
-            'pred_logits': pred_logits,
-            'pred_boxes': pred_boxes
-        }
-        
-        # Compute losses
-        losses = criterion(outputs, targets)
-        
-        # Total loss
-        loss = sum(losses.values())
-        
-        # Backward
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        # Backward pass with optional GradScaler
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         
         if scheduler is not None:
             scheduler.step()
@@ -299,6 +320,17 @@ def main(args):
         weight_decay=args.weight_decay
     )
     
+    # Setup mixed precision training
+    scaler = None
+    if args.mixed_precision and torch.cuda.is_available():
+        print(f"\n🚀 Mixed Precision: ENABLED (FP16)")
+        scaler = GradScaler()
+        # Convert model to FP16 for training and saving
+        model = model.half()
+        print(f"   ✓ Model converted to FP16")
+    else:
+        print(f"\n🚀 Mixed Precision: DISABLED (FP32)")
+    
     # Build scheduler
     if args.lr_schedule == 'cosine':
         total_steps = args.epochs * len(train_loader)
@@ -318,14 +350,33 @@ def main(args):
         print(f"\nLoading checkpoint: {args.checkpoint_path}")
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
         
-        # Load model weights
-        model.load_state_dict(checkpoint['model'])
-        print(f"✓ Loaded model weights from checkpoint")
+        # Load model weights and convert FP32→FP16 if needed
+        model_state = checkpoint['model']
+        
+        # Check if we need to convert FP32 checkpoint to FP16
+        if args.mixed_precision:
+            checkpoint_dtype = next(iter(model_state.values())).dtype
+            if checkpoint_dtype == torch.float32:
+                print(f"   📋 Converting FP32 checkpoint to FP16 for training")
+                # Convert FP32 checkpoint to FP16
+                model_state = {k: v.half() if v.dtype == torch.float32 else v for k, v in model_state.items()}
+                print(f"✓ Loaded model weights from checkpoint (FP32 → FP16)")
+            else:
+                print(f"✓ Loaded model weights from checkpoint (FP16 → FP16)")
+        else:
+            print(f"✓ Loaded model weights from checkpoint (FP32 mode)")
+        
+        model.load_state_dict(model_state)
         
         # Optionally load optimizer/scheduler state (only if reset_optimizer is False)
         if not args.reset_optimizer and 'optimizer' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             print(f"✓ Loaded optimizer state")
+            
+            # Load GradScaler state if available and using mixed precision
+            if args.mixed_precision and 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+                print(f"✓ Loaded GradScaler state")
             
             if scheduler is not None and 'scheduler' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler'])
@@ -347,7 +398,7 @@ def main(args):
     for epoch in range(start_epoch, args.epochs):
         # Train
         train_metrics = train_one_epoch(
-            model, criterion, train_loader, optimizer, scheduler, device, epoch
+            model, criterion, train_loader, optimizer, scheduler, device, epoch, scaler
         )
         
         # Validate
@@ -380,41 +431,84 @@ def main(args):
         if val_metrics['mean_iou'] < 0.1 and epoch < 10:
             print(f"  ⚠️  IoU very low! Check: 1) --pretrained_backbone flag, 2) data labels, 3) bbox normalization")
         
-        # Save best checkpoint (only model weights)
+        # Save best checkpoint
         if val_metrics['mean_iou'] > best_iou:
             best_iou = val_metrics['mean_iou']
+            
+            # Prepare model state - ensure FP16 if using mixed precision
+            model_state = model.state_dict()
+            if args.mixed_precision:
+                # Ensure all weights are FP16
+                model_state = {k: v.half() if v.dtype == torch.float32 else v for k, v in model_state.items()}
+            
             checkpoint = {
-                'model': model.state_dict(),
+                'model': model_state,
                 'epoch': epoch,
-                'best_iou': best_iou
+                'best_iou': best_iou,
+                'mixed_precision': args.mixed_precision
             }
+            
+            # Add GradScaler state if using mixed precision
+            if args.mixed_precision and scaler is not None:
+                checkpoint['scaler'] = scaler.state_dict()
+            
             torch.save(checkpoint, output_dir / "best.pth")
-            print(f"  → Saved best checkpoint (IoU: {best_iou:.4f})")
+            precision_str = "FP16" if args.mixed_precision else "FP32"
+            print(f"  → Saved best checkpoint ({precision_str}, IoU: {best_iou:.4f})")
         
-        # Save periodic checkpoint (only model weights)
+        # Save periodic checkpoint
         if (epoch + 1) % args.save_every == 0:
+            # Prepare model state - ensure FP16 if using mixed precision
+            model_state = model.state_dict()
+            if args.mixed_precision:
+                model_state = {k: v.half() if v.dtype == torch.float32 else v for k, v in model_state.items()}
+            
             checkpoint = {
-                'model': model.state_dict(),
+                'model': model_state,
+                'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
-                'best_iou': best_iou
+                'best_iou': best_iou,
+                'mixed_precision': args.mixed_precision
             }
+            
+            # Add scheduler and scaler states
+            if scheduler is not None:
+                checkpoint['scheduler'] = scheduler.state_dict()
+            if args.mixed_precision and scaler is not None:
+                checkpoint['scaler'] = scaler.state_dict()
+            
             torch.save(checkpoint, output_dir / f"checkpoint_epoch_{epoch+1}.pth")
         
         # Save last epoch checkpoint (always overwrite)
+        model_state = model.state_dict()
+        if args.mixed_precision:
+            model_state = {k: v.half() if v.dtype == torch.float32 else v for k, v in model_state.items()}
+        
         last_checkpoint = {
-            'model': model.state_dict(),
+            'model': model_state,
+            'optimizer': optimizer.state_dict(),
             'epoch': epoch,
-            'best_iou': best_iou
+            'best_iou': best_iou,
+            'mixed_precision': args.mixed_precision
         }
+        
+        if scheduler is not None:
+            last_checkpoint['scheduler'] = scheduler.state_dict()
+        if args.mixed_precision and scaler is not None:
+            last_checkpoint['scaler'] = scaler.state_dict()
+            
         torch.save(last_checkpoint, output_dir / f"last_epoch_{epoch+1}.pth")
         
         # Save history
         with open(output_dir / "history.json", 'w') as f:
             json.dump(history, f, indent=2)
     
-    print(f"\nTraining complete! Best IoU: {best_iou:.4f}")
+    precision_str = "FP16" if args.mixed_precision else "FP32"
+    print(f"\nTraining complete! Best IoU: {best_iou:.4f} ({precision_str})")
     print(f"Last epoch: {args.epochs}")
     print(f"Checkpoints saved to: {output_dir}")
+    if args.mixed_precision:
+        print(f"📁 All checkpoints saved in FP16 format")
 
 
 if __name__ == "__main__":
@@ -451,6 +545,8 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--augment_prob", type=float, default=0.5)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--mixed_precision", action="store_true", 
+                        help="Enable FP16 mixed precision training")
     
     # Checkpointing
     parser.add_argument("--checkpoint_path", type=str, default=None)
