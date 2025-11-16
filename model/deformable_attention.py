@@ -17,6 +17,8 @@ class MultiScaleDeformableAttention(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.num_levels = num_levels
         self.num_points = num_points
         self.total_points = num_levels * num_points
@@ -97,11 +99,18 @@ class MultiScaleDeformableAttention(nn.Module):
             # Convert from [0, 1] to [-1, 1] for grid_sample
             lvl_sampling_loc = lvl_sampling_loc * 2.0 - 1.0
             
-            # Expand value features: (B, embed_dim, H, W) -> (B * num_queries * num_heads, embed_dim, H, W)
-            value_feat_expanded = value_feat.unsqueeze(1).expand(B, num_queries * self.num_heads, C, H, W)
-            value_feat_expanded = value_feat_expanded.reshape(B * num_queries * self.num_heads, C, H, W)
+            # Split embed_dim into num_heads * head_dim BEFORE sampling
+            # (B, embed_dim, H, W) -> (B, num_heads, head_dim, H, W)
+            value_feat_split = value_feat.view(B, self.num_heads, self.head_dim, H, W)
             
-            # Sample: (B * num_queries * num_heads, embed_dim, 1, num_points)
+            # Expand for each query: (B, num_heads, head_dim, H, W) -> (B * num_queries, num_heads, head_dim, H, W)
+            value_feat_expanded = value_feat_split.unsqueeze(1).expand(B, num_queries, self.num_heads, self.head_dim, H, W)
+            value_feat_expanded = value_feat_expanded.reshape(B * num_queries, self.num_heads, self.head_dim, H, W)
+            
+            # Reshape for grid_sample: (B * num_queries * num_heads, head_dim, H, W)
+            value_feat_expanded = value_feat_expanded.reshape(B * num_queries * self.num_heads, self.head_dim, H, W)
+            
+            # Sample: (B * num_queries * num_heads, head_dim, 1, num_points)
             sampled = F.grid_sample(
                 value_feat_expanded,
                 lvl_sampling_loc,
@@ -110,22 +119,22 @@ class MultiScaleDeformableAttention(nn.Module):
                 align_corners=False
             )
             
-            # Reshape: (B, num_queries, num_heads, embed_dim, num_points)
-            sampled = sampled.reshape(B, num_queries, self.num_heads, C, self.num_points)
+            # Reshape: (B, num_queries, num_heads, head_dim, num_points)
+            sampled = sampled.reshape(B, num_queries, self.num_heads, self.head_dim, self.num_points)
             sampled_features.append(sampled)
         
-        # Stack all levels: (B, num_queries, num_heads, embed_dim, num_levels, num_points)
+        # Stack all levels: (B, num_queries, num_heads, head_dim, num_levels, num_points)
         sampled_features = torch.stack(sampled_features, dim=4)
         
         # Apply attention weights: (B, num_queries, num_heads, num_levels, num_points)
+        # Unsqueeze at dim=3 (after head_dim) to broadcast correctly
         attention_weights = attention_weights.unsqueeze(3)  # (B, num_queries, num_heads, 1, num_levels, num_points)
         
-        # Weighted sum: (B, num_queries, num_heads, embed_dim)
+        # Weighted sum: (B, num_queries, num_heads, head_dim)
         output = (sampled_features * attention_weights).sum(dim=[4, 5])
         
-        # Reshape: (B, num_queries, num_heads, embed_dim) -> (B, num_queries, embed_dim)
-        # Average over heads (or could concatenate, but averaging is simpler)
-        output = output.mean(dim=2)  # (B, num_queries, embed_dim)
+        # Concatenate heads: (B, num_queries, num_heads, head_dim) -> (B, num_queries, embed_dim)
+        output = output.reshape(B, num_queries, self.embed_dim)
         
         # Output projection
         output = self.output_proj(output)
