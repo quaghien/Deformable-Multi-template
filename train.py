@@ -114,6 +114,7 @@ def evaluate(model, criterion, loader, device, epoch):
     total_loss_bbox = 0.0
     total_loss_giou = 0.0
     total_iou = 0.0
+    total_iou_best_of_all = 0.0  # Best IoU among all queries (model potential)
     num_samples = 0
     
     with torch.no_grad():
@@ -153,22 +154,28 @@ def evaluate(model, criterion, loader, device, epoch):
             for i in range(batch_size):
                 gt_box = targets[i]['boxes'][0].unsqueeze(0)  # (1, 4)
                 
-                # Compute IoU với TẤT CẢ queries
+                # Method 1: Chọn query theo HIGHEST CONFIDENCE (giống inference)
+                best_idx = pred_logits[i].sigmoid().argmax()
+                pred_box = pred_boxes[i, best_idx].unsqueeze(0)
+                iou_by_conf = compute_iou(pred_box, gt_box).item()
+                
+                # Method 2: Best IoU among all queries (upper bound performance)
                 ious = []
-                for j in range(pred_boxes.shape[1]):  # num_queries
+                for j in range(pred_boxes.shape[1]):
                     pred_box = pred_boxes[i, j].unsqueeze(0)
                     iou = compute_iou(pred_box, gt_box).item()
                     ious.append(iou)
+                iou_best = max(ious)
                 
-                # Lấy IoU TỐT NHẤT (để evaluate model potential)
-                best_iou = max(ious)
-                total_iou += best_iou
+                total_iou += iou_by_conf  # IoU của query được chọn (realistic)
+                total_iou_best_of_all += iou_best  # IoU tốt nhất có thể (potential)
                 num_samples += 1
             
             # Update progress bar
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
-                "iou": f"{total_iou/num_samples:.4f}"
+                "iou": f"{total_iou/num_samples:.4f}",
+                "iou_max": f"{total_iou_best_of_all/num_samples:.4f}"
             })
     
     steps = len(loader)
@@ -178,6 +185,7 @@ def evaluate(model, criterion, loader, device, epoch):
         "loss_bbox": total_loss_bbox / steps,
         "loss_giou": total_loss_giou / steps,
         "mean_iou": total_iou / num_samples if num_samples > 0 else 0.0,
+        "mean_iou_best": total_iou_best_of_all / num_samples if num_samples > 0 else 0.0,
     }
 
 
@@ -341,7 +349,14 @@ def main(args):
               f"BBox: {train_metrics['loss_bbox']:.4f}, "
               f"GIoU: {train_metrics['loss_giou']:.4f}")
         print(f"  Val   - Loss: {val_metrics['loss']:.4f}, "
-              f"IoU: {val_metrics['mean_iou']:.4f}")
+              f"IoU: {val_metrics['mean_iou']:.4f} "
+              f"(best_possible: {val_metrics['mean_iou_best']:.4f})")
+        
+        # Debug: Show gap between actual vs potential
+        iou_gap = val_metrics['mean_iou_best'] - val_metrics['mean_iou']
+        if iou_gap > 0.1 and epoch > 20:
+            print(f"  ⚠️  IoU gap: {iou_gap:.4f} - Model not selecting best queries! "
+                  f"Classification head needs more training.")
         
         # Debug: Show if IoU is too low
         if val_metrics['mean_iou'] < 0.1 and epoch < 10:
