@@ -52,8 +52,9 @@ class ReferenceDetectionDataset(Dataset):
         self.template_paths = self._collect_templates()
         self.samples = self._collect_samples()
         
-        # Build transforms
-        self.transform = build_transforms(img_size=img_size, augment=self.augment)
+        # Build transforms - Tách riêng template vs search
+        self.template_transform = build_transforms(img_size=img_size, augment=False)  # Template: không augment
+        self.search_transform = build_transforms(img_size=img_size, augment=self.augment)  # Search: có augment
     
     @staticmethod
     def _extract_video_id(filename: str) -> str:
@@ -155,57 +156,59 @@ class ReferenceDetectionDataset(Dataset):
         # Parse label
         x_c, y_c, w, h = self._parse_label(label_path)
         
-        # Decide whether to augment
+        # Decide whether to augment SEARCH image (template luôn không augment)
         should_augment = self.augment and random.random() < self.augment_prob
         
-        # Generate shared augmentation parameters
+        # Generate augmentation parameters cho SEARCH IMAGE
+        # Version tối ưu: cân bằng giữa diversity và template-search consistency
         if should_augment:
             aug_params = {
-                'angle': random.uniform(-5, 5),
-                'flip_h': random.random() < 0.5,
-                'flip_v': False,  # Disable vertical flip
-                'brightness': random.uniform(0.8, 1.2),
-                'contrast': random.uniform(0.8, 1.2),
-                'saturation': random.uniform(0.8, 1.2),
+                # Geometric augmentations
+                'angle': random.uniform(-3, 3),          # ±3° (giảm từ ±5°)
+                'flip_h': random.random() < 0.5,         # 50% horizontal flip
+                'scale': random.uniform(0.93, 1.07),     # Scale jitter cho tiny objects
+                'translate_x': random.uniform(-0.03, 0.03),  # ±3% translation X
+                'translate_y': random.uniform(-0.03, 0.03),  # ±3% translation Y
+                # Color augmentations (giảm cường độ để tránh mismatch)
+                'brightness': random.uniform(0.75, 1.25),  # 0.75-1.25 (từ 0.7-1.3)
+                'contrast': random.uniform(0.75, 1.25),    # 0.75-1.25 (từ 0.7-1.3)
+                'saturation': random.uniform(0.8, 1.2),    # 0.8-1.2 (từ 0.7-1.3)
+                'hue': random.uniform(-0.03, 0.03),        # ±0.03 (từ ±0.05) - QUAN TRỌNG
+                # Other augmentations
+                'blur': random.random() < 0.3,
+                'noise': random.random() < 0.15,     # Giảm từ 0.2 → 0.15
+                'cutout': random.random() < 0.2,
             }
         else:
-            aug_params = {
-                'angle': 0.0,
-                'flip_h': False,
-                'flip_v': False,
-                'brightness': 1.0,
-                'contrast': 1.0,
-                'saturation': 1.0,
-            }
+            aug_params = None  # Không augment → None (quan trọng!)
         
-        # Transform 3 templates
+        # Transform 3 templates - KHÔNG BAO GIỜ augment
         template_tensors = []
         for template_path in selected_templates:
-            template_tensor = self.transform(template_path, aug_params=aug_params)
+            template_tensor = self.template_transform(template_path, aug_params=None)
             template_tensors.append(template_tensor)
         
         # Stack templates: (3, 3, H, W)
         templates = torch.stack(template_tensors)
         
-        # Transform search image
-        search_tensor = self.transform(img_path, aug_params=aug_params)
+        # Transform search image - Augment theo aug_params
+        search_tensor = self.search_transform(img_path, aug_params=aug_params)
         
-        # Transform bbox to match image augmentation
-        x_c_aug, y_c_aug, w_aug, h_aug = transform_bbox(
-            x_c, y_c, w, h,
-            img_size=self.img_size,
-            angle=aug_params['angle'],
-            flip_h=aug_params['flip_h'],
-            flip_v=aug_params['flip_v']
-        )
-        
-        # Debug: Print augmentation info for first sample in training
-        if idx == 0 and self.split == 'train' and should_augment:
-            print(f"\n[DEBUG] Sample 0 Augmentation Applied:")
-            print(f"  Angle: {aug_params['angle']:.2f}°")
-            print(f"  Flip H: {aug_params['flip_h']}")
-            print(f"  Brightness: {aug_params['brightness']:.2f}")
-            print(f"  BBox transform: [{x_c:.3f},{y_c:.3f},{w:.3f},{h:.3f}] → [{x_c_aug:.3f},{y_c_aug:.3f},{w_aug:.3f},{h_aug:.3f}]")
+        # Transform bbox to match search image augmentation (scale, translate, rotate, flip)
+        if aug_params is not None:
+            x_c_aug, y_c_aug, w_aug, h_aug = transform_bbox(
+                x_c, y_c, w, h,
+                img_size=self.img_size,
+                angle=aug_params['angle'],
+                flip_h=aug_params['flip_h'],
+                flip_v=False,  # Không dùng vertical flip
+                scale=aug_params['scale'],
+                translate_x=aug_params['translate_x'],
+                translate_y=aug_params['translate_y']
+            )
+        else:
+            # Không augment → bbox giữ nguyên
+            x_c_aug, y_c_aug, w_aug, h_aug = x_c, y_c, w, h
         
         return {
             'templates': templates,  # (3, 3, H, W)

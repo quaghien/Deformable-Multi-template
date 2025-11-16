@@ -277,7 +277,9 @@ def main(args):
         shuffle=True,
         num_workers=args.workers,
         collate_fn=collate_fn,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4
     )
     val_loader = DataLoader(
         val_dataset,
@@ -285,7 +287,9 @@ def main(args):
         shuffle=False,
         num_workers=args.workers,
         collate_fn=collate_fn,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4
     )
     
     # Build optimizer
@@ -313,14 +317,28 @@ def main(args):
     if args.checkpoint_path and Path(args.checkpoint_path).exists():
         print(f"\nLoading checkpoint: {args.checkpoint_path}")
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
+        
+        # Load model weights
         model.load_state_dict(checkpoint['model'])
-        if not args.reset_optimizer:
+        print(f"✓ Loaded model weights from checkpoint")
+        
+        # Optionally load optimizer/scheduler state (only if reset_optimizer is False)
+        if not args.reset_optimizer and 'optimizer' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
+            print(f"✓ Loaded optimizer state")
+            
             if scheduler is not None and 'scheduler' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler'])
+                print(f"✓ Loaded scheduler state")
+            
             start_epoch = checkpoint.get('epoch', 0) + 1
             best_iou = checkpoint.get('best_iou', 0.0)
-        print(f"Resuming from epoch {start_epoch}, best IoU: {best_iou:.4f}")
+            print(f"✓ Resuming from epoch {start_epoch}, best IoU: {best_iou:.4f}")
+        else:
+            # Train from scratch with loaded weights
+            print(f"✓ Training from epoch 0 with loaded model weights (optimizer reset)")
+            start_epoch = 0
+            best_iou = 0.0
     
     # Training loop
     print(f"\nStarting training for {args.epochs} epochs")

@@ -2,7 +2,7 @@
 
 **Swin-Tiny + Deformable Attention for Reference-Based Detection**
 
-Target: **IoU > 0.90** | Params: **~28M** | Verified: **✅ Production Ready**
+Target: **IoU > 0.90** | Params: **~28M** | Speed: **~3x faster**
 
 ---
 
@@ -52,11 +52,15 @@ data/
 
 ### 3. Train
 ```bash
-# Minimal command (uses defaults)
+# Recommended command
+conda activate aivn
 python train.py \
   --data_dir data/ \
   --output_dir outputs/ \
-  --pretrained_backbone
+  --pretrained_backbone \
+  --batch_size 32 \
+  --workers 12 \
+  --augment_prob 0.1
 
 # Full command with all parameters
 python train.py \
@@ -79,12 +83,8 @@ python train.py \
   --batch_size 32 \
   --epochs 100 \
   --lr 1e-4 \
-  --min_lr 1e-6 \
-  --lr_schedule cosine \
-  --weight_decay 1e-4 \
-  --augment_prob 0.5 \
-  --workers 4 \
-  --save_every 10 \
+  --workers 12 \
+  --augment_prob 0.1 \
   --seed 42
 ```
 
@@ -108,123 +108,25 @@ python inference.py \
 
 ---
 
-## 📁 Project Structure
+## ⚙️ Data Augmentation (Optimized)
 
-```
-deformable-ref-detection/
-├── model/
-│   ├── model.py                 # Main DeformableRefDet
-│   ├── swin_backbone.py         # Swin-Tiny wrapper
-│   ├── template_encoder.py     # 9-token encoder
-│   ├── deformable_attention.py # Multi-scale sampling
-│   ├── decoder.py               # Decoder layers
-│   ├── losses.py                # Focal + L1 + GIoU
-│   └── matcher.py               # Hungarian matcher
-├── utils/
-│   ├── dataset.py               # Multi-template dataset
-│   └── transforms.py            # Augmentation pipeline
-├── train.py                     # Training script
-├── inference.py                 # Inference script
-├── test_forward_backward.py    # Validation tests
-└── requirements.txt
-```
-    ├── dataset.py               # Multi-template dataset
-    └── transforms.py            # Augmentation
-```
+**Template: KHÔNG augment** (resize + normalize only)
 
----
+**Search: Augment tối ưu** (prob=0.1)
 
-## 🔧 Configuration
+| Type | Parameter | Range | Note |
+|------|-----------|-------|------|
+| Geometric | Rotation | ±3° | Giảm từ ±5° |
+| | Flip H | 50% | - |
+| | Scale | 0.93-1.07 | Tiny objects |
+| | Translate | ±3% | X, Y độc lập |
+| Color | Brightness | 0.75-1.25 | Từ 0.7-1.3 |
+| | Contrast | 0.75-1.25 | Từ 0.7-1.3 |
+| | Saturation | 0.8-1.2 | Từ 0.7-1.3 |
+| | Hue | ±0.03 | ⚠️ Từ ±0.05 |
+| Other | Blur | 30% | σ=0.5-2.0 |
+| | Noise | 15% | σ=0.05 |
+| | Cutout | 20% | 2-5% |
 
-**Default hyperparams (optimized for IoU > 0.90)**:
-
----
-
-## ⚙️ Default Hyperparameters
-
-```python
-# Model Architecture
-num_queries = 5           # Number of query slots
-hidden_dim = 256          # Feature dimension
-num_decoder_layers = 6    # Decoder depth
-num_heads = 8             # Attention heads
-dim_feedforward = 1024    # FFN dimension
-dropout = 0.1
-num_points = 4            # Sampling points per level
-
-# Loss Weights
-loss_ce_weight = 1.0      # Classification
-loss_bbox_weight = 5.0    # L1 regression
-loss_giou_weight = 2.0    # GIoU
-focal_alpha = 0.25
-focal_gamma = 2.0
-
-# Training
-batch_size = 32
-epochs = 100
-lr = 1e-4                 # Initial learning rate
-min_lr = 1e-6             # Minimum LR for cosine schedule
-weight_decay = 1e-4
-augment_prob = 0.5        # Data augmentation probability
-```
-
----
-
-## 📊 Expected Performance
-
-| Epoch | Val IoU | Notes |
-|-------|---------|-------|
-| 25 | ~0.75 | Early learning |
-| 50 | ~0.85 | Converging |
-| 100 | **0.90+** | Target achieved |
-
-**Training Time:** ~6-8 hours on V100 (batch_size=32)  
-**GPU Memory:** ~10GB (batch_size=32)
-
----
-
-## ✅ Validation Status
-
-**Model verified on:** November 15, 2025
-
-- ✅ Forward pass shapes verified
-- ✅ Backward pass & gradient flow verified
-- ✅ Loss computation validated (no NaN/Inf)
-- ✅ Deformable attention tested
-- ✅ Multi-scale feature extraction working
-- ✅ Template-conditioned queries working
-
-See `VALIDATION_FINAL.md` for detailed test results.
-
----
-
-## 🔧 Troubleshooting
-
-**OOM (Out of Memory):**
-- Reduce `batch_size` to 16 or 8
-- Reduce `num_decoder_layers` to 4
-- Use gradient checkpointing (requires code modification)
-
-**Low IoU:**
-- Ensure `--pretrained_backbone` is set
-- Check data augmentation is enabled (`--augment_prob 0.5`)
-- Verify label format is correct (YOLO: cls cx cy w h, normalized)
-- Try training longer (150-200 epochs)
-
-**Slow training:**
-- Increase `--workers` (4-8 recommended)
-- Enable mixed precision training (requires code modification)
-
----
-
-## 📚 References
-
-- [Swin Transformer](https://arxiv.org/abs/2103.14030) - Liu et al., ICCV 2021
-- [Deformable DETR](https://arxiv.org/abs/2010.04159) - Zhu et al., ICLR 2021
-- [DETR](https://arxiv.org/abs/2005.12872) - Carion et al., ECCV 2020
-
----
-
-**License:** MIT  
-**Status:** ✅ Production Ready (Validated Nov 2025)
+**Lý do giảm color aug:** Tránh template-search mismatch → IoU tốt hơn
 
